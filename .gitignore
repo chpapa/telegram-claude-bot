@@ -1,0 +1,6 @@
+.env
+.venv/
+.claude/
+sessions.json
+downloads/
+__pycache__/
