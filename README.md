@@ -2,6 +2,10 @@
 
 A Telegram bot that forwards messages to [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code), giving you access to an agentic coding assistant from your phone. Supports text messages, documents (PDF), and photos.
 
+## Why
+
+Some of us have been running Claude Code on an Obsidian vault as a personal assistant for months. It accumulates knowledge over time through CLAUDE.md and custom slash commands/skills, and is more controllable compared to something like [Open Claw](https://github.com/anthropics/open-claw). The missing piece was mobile access -- SSH from a phone works but is painful. Talking to your AI assistant through a messenger is a much better experience, so I built this.
+
 ## Features
 
 - **Session continuity** -- conversations persist across messages using `--resume`
