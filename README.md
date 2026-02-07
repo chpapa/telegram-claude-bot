@@ -1,6 +1,6 @@
 # Telegram Claude Code Bot
 
-A Telegram bot that forwards messages to [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code), giving you access to an agentic coding assistant from your phone. Supports text messages, documents (PDF), and photos.
+A personal AI assistant over Telegram, like [Open Claw](https://github.com/anthropics/open-claw) but built on top of [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code). Text it from your phone, send it documents and photos, and let it work with your files using the full set of Claude Code tools.
 
 ## Why
 
