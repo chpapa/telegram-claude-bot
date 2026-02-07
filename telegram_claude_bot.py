@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
-"""Telegram bot that forwards messages to Claude Code CLI."""
+"""Telegram bot that forwards messages to Claude Code CLI.
+
+Supports multiple bot instances running in a single process, each with its own
+token, authorized users, working directory, and independent sessions.
+Configuration is read from bots_config.yaml.
+"""
 
 import asyncio
 import html as html_mod
 import json
 import logging
-import os
 import re
+import signal
+import sys
 import time
 from pathlib import Path
 
-from dotenv import load_dotenv
+import yaml
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -20,286 +26,17 @@ from telegram.ext import (
     filters,
 )
 
-load_dotenv()
-
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-AUTHORIZED_USER_IDS = {
-    int(uid.strip())
-    for uid in os.environ["AUTHORIZED_USER_IDS"].split(",")
-    if uid.strip()
-}
-CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
-WORKING_DIR = os.environ.get("WORKING_DIR", ".")
-CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "300"))
-SESSIONS_FILE = Path(__file__).parent / "sessions.json"
-DOWNLOADS_DIR = Path(__file__).parent / "downloads"
-DOWNLOADS_DIR.mkdir(exist_ok=True)
-
 ALLOWED_TOOLS = (
     "Bash,Read,Write,Edit,Glob,Grep,WebFetch,WebSearch,Skill,Task"
 )
 
-# Per-chat locks to prevent concurrent Claude calls
-_chat_locks: dict[int, asyncio.Lock] = {}
-
-
-def get_chat_lock(chat_id: int) -> asyncio.Lock:
-    if chat_id not in _chat_locks:
-        _chat_locks[chat_id] = asyncio.Lock()
-    return _chat_locks[chat_id]
-
-
-# --- Session persistence ---
-
-def load_sessions() -> dict[str, str]:
-    if SESSIONS_FILE.exists():
-        try:
-            return json.loads(SESSIONS_FILE.read_text())
-        except (json.JSONDecodeError, OSError):
-            logger.warning("Failed to read sessions file, starting fresh")
-    return {}
-
-
-def save_sessions(sessions: dict[str, str]) -> None:
-    tmp = SESSIONS_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(sessions, indent=2))
-    tmp.rename(SESSIONS_FILE)
-
-
-def get_session_id(chat_id: int) -> str | None:
-    sessions = load_sessions()
-    return sessions.get(str(chat_id))
-
-
-def set_session_id(chat_id: int, session_id: str) -> None:
-    sessions = load_sessions()
-    sessions[str(chat_id)] = session_id
-    save_sessions(sessions)
-
-
-def clear_session(chat_id: int) -> None:
-    sessions = load_sessions()
-    sessions.pop(str(chat_id), None)
-    save_sessions(sessions)
-
-
-# --- Authorization ---
-
-def authorized(func):
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        if user_id not in AUTHORIZED_USER_IDS:
-            logger.warning(f"Unauthorized access attempt from user {user_id}")
-            await update.message.reply_text("Unauthorized.")
-            return
-        return await func(update, context)
-    return wrapper
-
-
-# --- Claude CLI ---
-
-async def send_typing_loop(chat) -> None:
-    """Send typing action every 5 seconds until cancelled."""
-    try:
-        while True:
-            await chat.send_action("typing")
-            await asyncio.sleep(5)
-    except asyncio.CancelledError:
-        pass
-
-
-# Friendly names for common tools
-_TOOL_LABELS = {
-    "Bash": "Running command",
-    "Read": "Reading file",
-    "Write": "Writing file",
-    "Edit": "Editing file",
-    "Glob": "Searching files",
-    "Grep": "Searching code",
-    "WebFetch": "Fetching web page",
-    "WebSearch": "Searching the web",
-    "Task": "Running sub-task",
-}
-
-STATUS_THROTTLE_SECS = 8  # Minimum seconds between status messages
-MAX_DETAIL_LEN = 120  # Truncate tool detail to keep status messages short
-
-
-def _tool_detail(tool_name: str, tool_input: dict) -> str:
-    """Extract a short description from tool input for status messages."""
-    detail = ""
-    if tool_name == "Bash":
-        detail = tool_input.get("command", "")
-    elif tool_name in ("Read", "Write", "Edit"):
-        detail = tool_input.get("file_path", "")
-    elif tool_name == "Glob":
-        detail = tool_input.get("pattern", "")
-    elif tool_name == "Grep":
-        detail = tool_input.get("pattern", "")
-    elif tool_name in ("WebFetch", "WebSearch"):
-        detail = tool_input.get("url", "") or tool_input.get("query", "")
-    if len(detail) > MAX_DETAIL_LEN:
-        detail = detail[:MAX_DETAIL_LEN] + "…"
-    return detail
-
-
-async def call_claude(
-    message: str, session_id: str | None = None, chat=None
-) -> tuple[str, str | None]:
-    """Call Claude CLI with streaming output and return (response_text, session_id)."""
-    args = [
-        CLAUDE_BIN,
-        "--print",
-        message,
-        "--output-format", "stream-json",
-        "--verbose",
-        "--allowedTools", ALLOWED_TOOLS,
-    ]
-    if session_id:
-        args.extend(["--resume", session_id])
-
-    logger.info(f"Calling Claude (session={session_id or 'new'})")
-
-    proc = await asyncio.create_subprocess_exec(
-        *args,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=WORKING_DIR,
-    )
-
-    # Keep typing indicator alive throughout
-    typing_task = None
-    if chat:
-        typing_task = asyncio.create_task(send_typing_loop(chat))
-
-    result_text = ""
-    new_session_id = session_id
-    last_status_time = 0.0
-    deadline = time.monotonic() + CLAUDE_TIMEOUT
-
-    # Use chunked reads instead of readline() to avoid the 64KB line
-    # length limit — Claude's stream-json can emit very long lines when
-    # tool results contain large file contents.
-    buf = b""
-    try:
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                proc.kill()
-                await proc.communicate()
-                return (
-                    f"Claude timed out after {CLAUDE_TIMEOUT}s. Try a simpler request.",
-                    session_id,
-                )
-
-            try:
-                chunk = await asyncio.wait_for(
-                    proc.stdout.read(1024 * 1024), timeout=remaining
-                )
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.communicate()
-                return (
-                    f"Claude timed out after {CLAUDE_TIMEOUT}s. Try a simpler request.",
-                    session_id,
-                )
-
-            if not chunk:  # EOF
-                break
-
-            buf += chunk
-
-            # Process all complete lines in the buffer
-            while b"\n" in buf:
-                raw_line, buf = buf.split(b"\n", 1)
-                line = raw_line.decode().strip()
-                if not line:
-                    continue
-
-                try:
-                    data = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-
-                msg_type = data.get("type")
-
-                # Capture session_id from any message that carries it
-                if "session_id" in data:
-                    new_session_id = data["session_id"]
-
-                # Notify user about tool usage
-                if msg_type == "assistant":
-                    content = data.get("message", {}).get("content", [])
-                    for block in content:
-                        if block.get("type") == "tool_use" and chat:
-                            tool_name = block.get("name", "unknown")
-                            now = time.monotonic()
-                            if now - last_status_time >= STATUS_THROTTLE_SECS:
-                                label = _TOOL_LABELS.get(tool_name, f"Using {tool_name}")
-                                detail = _tool_detail(tool_name, block.get("input", {}))
-                                status = f"⏳ {label}..."
-                                if detail:
-                                    status += f"\n<code>{html_mod.escape(detail)}</code>"
-                                try:
-                                    await chat.send_message(status, parse_mode="HTML")
-                                    last_status_time = now
-                                except Exception:
-                                    pass
-
-                elif msg_type == "result":
-                    result_text = data.get("result", "")
-
-        await proc.wait()
-
-    finally:
-        if typing_task:
-            typing_task.cancel()
-            try:
-                await typing_task
-            except asyncio.CancelledError:
-                pass
-
-    if proc.returncode != 0:
-        stderr_text = (await proc.stderr.read()).decode().strip()
-        logger.error(f"Claude exited with code {proc.returncode}: {stderr_text}")
-        return (
-            f"Claude error (exit code {proc.returncode}):\n{stderr_text[:500]}",
-            session_id,
-        )
-
-    if not result_text:
-        return "Claude returned an empty response.", new_session_id
-
-    return result_text, new_session_id
-
-
-async def call_claude_with_retry(
-    message: str, chat_id: int, chat=None
-) -> tuple[str, str | None]:
-    """Call Claude with session resume, retry without session if it fails."""
-    session_id = get_session_id(chat_id)
-
-    result, new_session_id = await call_claude(message, session_id, chat=chat)
-
-    # If we got an error and were using a session, retry without it
-    if session_id and result.startswith("Claude error"):
-        logger.info(f"Retrying without session for chat {chat_id}")
-        clear_session(chat_id)
-        result, new_session_id = await call_claude(message, None, chat=chat)
-
-    if new_session_id:
-        set_session_id(chat_id, new_session_id)
-
-    return result, new_session_id
-
-
-# --- Markdown to Telegram HTML ---
+# --- Markdown to Telegram HTML (module-level, no per-bot state) ---
 
 def _extract_tables(text: str) -> tuple[str, list[str]]:
     """Detect markdown tables (consecutive lines with |) and replace with placeholders."""
@@ -392,7 +129,55 @@ def markdown_to_telegram_html(text: str) -> str:
     return text
 
 
-# --- Message sending ---
+# --- Typing indicator (module-level, no per-bot state) ---
+
+async def send_typing_loop(chat) -> None:
+    """Send typing action every 5 seconds until cancelled."""
+    try:
+        while True:
+            await chat.send_action("typing")
+            await asyncio.sleep(5)
+    except asyncio.CancelledError:
+        pass
+
+
+# --- Tool labels (module-level, no per-bot state) ---
+
+_TOOL_LABELS = {
+    "Bash": "Running command",
+    "Read": "Reading file",
+    "Write": "Writing file",
+    "Edit": "Editing file",
+    "Glob": "Searching files",
+    "Grep": "Searching code",
+    "WebFetch": "Fetching web page",
+    "WebSearch": "Searching the web",
+    "Task": "Running sub-task",
+}
+
+STATUS_THROTTLE_SECS = 8
+MAX_DETAIL_LEN = 120
+
+
+def _tool_detail(tool_name: str, tool_input: dict) -> str:
+    """Extract a short description from tool input for status messages."""
+    detail = ""
+    if tool_name == "Bash":
+        detail = tool_input.get("command", "")
+    elif tool_name in ("Read", "Write", "Edit"):
+        detail = tool_input.get("file_path", "")
+    elif tool_name == "Glob":
+        detail = tool_input.get("pattern", "")
+    elif tool_name == "Grep":
+        detail = tool_input.get("pattern", "")
+    elif tool_name in ("WebFetch", "WebSearch"):
+        detail = tool_input.get("url", "") or tool_input.get("query", "")
+    if len(detail) > MAX_DETAIL_LEN:
+        detail = detail[:MAX_DETAIL_LEN] + "…"
+    return detail
+
+
+# --- Message sending (module-level, no per-bot state) ---
 
 MAX_MSG_LEN = 4096
 
@@ -429,166 +214,11 @@ async def send_long_message(update: Update, text: str) -> None:
         try:
             await update.message.reply_text(html_chunk, parse_mode="HTML")
         except Exception:
-            # If HTML parsing fails, send as plain text
             logger.warning("HTML send failed, falling back to plain text")
             await update.message.reply_text(chunk)
 
 
-# --- Handlers ---
-
-@authorized
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle incoming text messages."""
-    chat_id = update.effective_chat.id
-    user_text = update.message.text
-
-    if not user_text:
-        return
-
-    lock = get_chat_lock(chat_id)
-    if lock.locked():
-        await update.message.reply_text(
-            "Still processing the previous message. Please wait."
-        )
-        return
-
-    async with lock:
-        result, _ = await call_claude_with_retry(
-            user_text, chat_id, chat=update.message.chat
-        )
-        await send_long_message(update, result)
-
-
-@authorized
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle incoming documents (PDF, etc.)."""
-    chat_id = update.effective_chat.id
-    doc = update.message.document
-
-    lock = get_chat_lock(chat_id)
-    if lock.locked():
-        await update.message.reply_text(
-            "Still processing the previous message. Please wait."
-        )
-        return
-
-    async with lock:
-        # Download file
-        file = await doc.get_file()
-        file_name = doc.file_name or f"document_{doc.file_id}"
-        save_path = DOWNLOADS_DIR / file_name
-        await file.download_to_drive(save_path)
-        logger.info(f"Downloaded document: {save_path}")
-
-        # Build prompt with caption if present
-        caption = update.message.caption or ""
-        prompt = f"I'm sending you a file saved at: {save_path}\nFilename: {file_name}"
-        if caption:
-            prompt += f"\n\nUser message: {caption}"
-        else:
-            prompt += "\n\nPlease read and summarize this file."
-
-        result, _ = await call_claude_with_retry(
-            prompt, chat_id, chat=update.message.chat
-        )
-        await send_long_message(update, result)
-
-
-@authorized
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle incoming photos."""
-    chat_id = update.effective_chat.id
-
-    lock = get_chat_lock(chat_id)
-    if lock.locked():
-        await update.message.reply_text(
-            "Still processing the previous message. Please wait."
-        )
-        return
-
-    async with lock:
-        # Get the largest photo size
-        photo = update.message.photo[-1]
-        file = await photo.get_file()
-        file_name = f"photo_{photo.file_unique_id}.jpg"
-        save_path = DOWNLOADS_DIR / file_name
-        await file.download_to_drive(save_path)
-        logger.info(f"Downloaded photo: {save_path}")
-
-        # Build prompt with caption if present
-        caption = update.message.caption or ""
-        prompt = f"I'm sending you an image saved at: {save_path}"
-        if caption:
-            prompt += f"\n\nUser message: {caption}"
-        else:
-            prompt += "\n\nPlease describe and analyze this image."
-
-        result, _ = await call_claude_with_retry(
-            prompt, chat_id, chat=update.message.chat
-        )
-        await send_long_message(update, result)
-
-
-@authorized
-async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Clear session and start fresh."""
-    chat_id = update.effective_chat.id
-    clear_session(chat_id)
-    await update.message.reply_text("Session cleared. Next message starts a fresh conversation.")
-
-
-@authorized
-async def cmd_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show current session ID."""
-    chat_id = update.effective_chat.id
-    session_id = get_session_id(chat_id)
-    if session_id:
-        await update.message.reply_text(f"Session: {session_id}")
-    else:
-        await update.message.reply_text("No active session.")
-
-
-@authorized
-async def handle_claude_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Forward unrecognized /commands to Claude as slash commands."""
-    chat_id = update.effective_chat.id
-    user_text = update.message.text
-
-    # Translate Telegram command name back to original Claude name.
-    # e.g. "/writing_clearly_and_concisely arg" → "/writing-clearly-and-concisely arg"
-    parts = user_text.split(None, 1)
-    tg_cmd = parts[0].lstrip("/").split("@")[0]  # strip / and @botname
-    original = _telegram_to_claude_cmd.get(tg_cmd, tg_cmd)
-    user_text = "/" + original
-    if len(parts) > 1:
-        user_text += " " + parts[1]
-
-    lock = get_chat_lock(chat_id)
-    if lock.locked():
-        await update.message.reply_text(
-            "Still processing the previous message. Please wait."
-        )
-        return
-
-    async with lock:
-        result, _ = await call_claude_with_retry(
-            user_text, chat_id, chat=update.message.chat
-        )
-        await send_long_message(update, result)
-
-
-@authorized
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /start command."""
-    await update.message.reply_text(
-        "Claude Code bot ready.\n\n"
-        "Send any message to chat with Claude.\n"
-        "/new - Start a fresh session\n"
-        "/session - Show current session ID"
-    )
-
-
-# --- Slash command discovery ---
+# --- Bot commands list ---
 
 BOT_COMMANDS = [
     ("start", "Show help"),
@@ -597,77 +227,536 @@ BOT_COMMANDS = [
 ]
 
 
-# Mapping from Telegram command name (underscores) back to original Claude
-# command name (hyphens etc.), populated at startup by discover_claude_commands().
-_telegram_to_claude_cmd: dict[str, str] = {}
+# --- BotInstance ---
 
+class BotInstance:
+    """Encapsulates all per-bot state and handlers."""
 
-def discover_claude_commands() -> list[tuple[str, str]]:
-    """Scan .claude/commands/ and .claude/skills/ for available slash commands."""
-    search_dirs = []
-    for base in [Path(WORKING_DIR), Path.home()]:
-        search_dirs.append(base / ".claude" / "commands")
-        search_dirs.append(base / ".claude" / "skills")
+    def __init__(
+        self,
+        name: str,
+        token: str,
+        authorized_user_ids: set[int],
+        working_dir: str,
+        claude_bin: str = "claude",
+        claude_timeout: int = 300,
+    ):
+        self.name = name
+        self.token = token
+        self.authorized_user_ids = authorized_user_ids
+        self.working_dir = working_dir
+        self.claude_bin = claude_bin
+        self.claude_timeout = claude_timeout
 
-    commands: list[tuple[str, str]] = []
-    seen: set[str] = set()
+        base = Path(__file__).parent
+        self.sessions_file = base / f"sessions_{name}.json"
+        self.downloads_dir = base / f"downloads_{name}"
+        self.downloads_dir.mkdir(exist_ok=True)
 
-    for d in search_dirs:
-        if not d.is_dir():
-            continue
-        for f in sorted(d.iterdir()):
-            if not f.suffix == ".md" or not f.is_file():
-                continue
-            name = f.stem
-            if name in seen:
-                continue
-            seen.add(name)
-            # Use first non-empty line of the file as description
+        self._chat_locks: dict[int, asyncio.Lock] = {}
+        self._telegram_to_claude_cmd: dict[str, str] = {}
+        self._app: Application | None = None
+
+        self._log = logging.getLogger(f"{__name__}.{name}")
+
+    # --- Session persistence ---
+
+    def get_chat_lock(self, chat_id: int) -> asyncio.Lock:
+        if chat_id not in self._chat_locks:
+            self._chat_locks[chat_id] = asyncio.Lock()
+        return self._chat_locks[chat_id]
+
+    def load_sessions(self) -> dict[str, str]:
+        if self.sessions_file.exists():
             try:
-                first_line = f.read_text().strip().split("\n")[0].strip()
-                # Strip leading markdown heading markers
-                desc = first_line.lstrip("#").strip()
-                if not desc:
+                return json.loads(self.sessions_file.read_text())
+            except (json.JSONDecodeError, OSError):
+                self._log.warning("Failed to read sessions file, starting fresh")
+        return {}
+
+    def save_sessions(self, sessions: dict[str, str]) -> None:
+        tmp = self.sessions_file.with_suffix(".tmp")
+        tmp.write_text(json.dumps(sessions, indent=2))
+        tmp.rename(self.sessions_file)
+
+    def get_session_id(self, chat_id: int) -> str | None:
+        sessions = self.load_sessions()
+        return sessions.get(str(chat_id))
+
+    def set_session_id(self, chat_id: int, session_id: str) -> None:
+        sessions = self.load_sessions()
+        sessions[str(chat_id)] = session_id
+        self.save_sessions(sessions)
+
+    def clear_session(self, chat_id: int) -> None:
+        sessions = self.load_sessions()
+        sessions.pop(str(chat_id), None)
+        self.save_sessions(sessions)
+
+    # --- Claude CLI ---
+
+    async def call_claude(
+        self, message: str, session_id: str | None = None, chat=None
+    ) -> tuple[str, str | None]:
+        """Call Claude CLI with streaming output and return (response_text, session_id)."""
+        args = [
+            self.claude_bin,
+            "--print",
+            message,
+            "--output-format", "stream-json",
+            "--verbose",
+            "--allowedTools", ALLOWED_TOOLS,
+        ]
+        if session_id:
+            args.extend(["--resume", session_id])
+
+        self._log.info(f"Calling Claude (session={session_id or 'new'})")
+
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=self.working_dir,
+        )
+
+        typing_task = None
+        if chat:
+            typing_task = asyncio.create_task(send_typing_loop(chat))
+
+        result_text = ""
+        new_session_id = session_id
+        last_status_time = 0.0
+        deadline = time.monotonic() + self.claude_timeout
+
+        buf = b""
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    proc.kill()
+                    await proc.communicate()
+                    return (
+                        f"Claude timed out after {self.claude_timeout}s. Try a simpler request.",
+                        session_id,
+                    )
+
+                try:
+                    chunk = await asyncio.wait_for(
+                        proc.stdout.read(1024 * 1024), timeout=remaining
+                    )
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.communicate()
+                    return (
+                        f"Claude timed out after {self.claude_timeout}s. Try a simpler request.",
+                        session_id,
+                    )
+
+                if not chunk:  # EOF
+                    break
+
+                buf += chunk
+
+                while b"\n" in buf:
+                    raw_line, buf = buf.split(b"\n", 1)
+                    line = raw_line.decode().strip()
+                    if not line:
+                        continue
+
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    msg_type = data.get("type")
+
+                    if "session_id" in data:
+                        new_session_id = data["session_id"]
+
+                    if msg_type == "assistant":
+                        content = data.get("message", {}).get("content", [])
+                        for block in content:
+                            if block.get("type") == "tool_use" and chat:
+                                tool_name = block.get("name", "unknown")
+                                now = time.monotonic()
+                                if now - last_status_time >= STATUS_THROTTLE_SECS:
+                                    label = _TOOL_LABELS.get(tool_name, f"Using {tool_name}")
+                                    detail = _tool_detail(tool_name, block.get("input", {}))
+                                    status = f"⏳ {label}..."
+                                    if detail:
+                                        status += f"\n<code>{html_mod.escape(detail)}</code>"
+                                    try:
+                                        await chat.send_message(status, parse_mode="HTML")
+                                        last_status_time = now
+                                    except Exception:
+                                        pass
+
+                    elif msg_type == "result":
+                        result_text = data.get("result", "")
+
+            await proc.wait()
+
+        finally:
+            if typing_task:
+                typing_task.cancel()
+                try:
+                    await typing_task
+                except asyncio.CancelledError:
+                    pass
+
+        if proc.returncode != 0:
+            stderr_text = (await proc.stderr.read()).decode().strip()
+            self._log.error(f"Claude exited with code {proc.returncode}: {stderr_text}")
+            return (
+                f"Claude error (exit code {proc.returncode}):\n{stderr_text[:500]}",
+                session_id,
+            )
+
+        if not result_text:
+            return "Claude returned an empty response.", new_session_id
+
+        return result_text, new_session_id
+
+    async def call_claude_with_retry(
+        self, message: str, chat_id: int, chat=None
+    ) -> tuple[str, str | None]:
+        """Call Claude with session resume, retry without session if it fails."""
+        session_id = self.get_session_id(chat_id)
+
+        result, new_session_id = await self.call_claude(message, session_id, chat=chat)
+
+        if session_id and result.startswith("Claude error"):
+            self._log.info(f"Retrying without session for chat {chat_id}")
+            self.clear_session(chat_id)
+            result, new_session_id = await self.call_claude(message, None, chat=chat)
+
+        if new_session_id:
+            self.set_session_id(chat_id, new_session_id)
+
+        return result, new_session_id
+
+    # --- Slash command discovery ---
+
+    def discover_claude_commands(self) -> list[tuple[str, str]]:
+        """Scan .claude/commands/ and .claude/skills/ for available slash commands."""
+        search_dirs = []
+        for base in [Path(self.working_dir), Path.home()]:
+            search_dirs.append(base / ".claude" / "commands")
+            search_dirs.append(base / ".claude" / "skills")
+
+        commands: list[tuple[str, str]] = []
+        seen: set[str] = set()
+
+        for d in search_dirs:
+            if not d.is_dir():
+                continue
+            for f in sorted(d.iterdir()):
+                if not f.suffix == ".md" or not f.is_file():
+                    continue
+                name = f.stem
+                if name in seen:
+                    continue
+                seen.add(name)
+                try:
+                    first_line = f.read_text().strip().split("\n")[0].strip()
+                    desc = first_line.lstrip("#").strip()
+                    if not desc:
+                        desc = name
+                except OSError:
                     desc = name
-            except OSError:
-                desc = name
-            # Telegram command names: lowercase, max 32 chars, no spaces
-            cmd_name = name.lower().replace(" ", "_").replace("-", "_")[:32]
-            _telegram_to_claude_cmd[cmd_name] = name
-            commands.append((cmd_name, desc[:256]))
+                cmd_name = name.lower().replace(" ", "_").replace("-", "_")[:32]
+                self._telegram_to_claude_cmd[cmd_name] = name
+                commands.append((cmd_name, desc[:256]))
 
-    return commands
+        return commands
+
+    # --- Handler factories ---
+
+    def _authorized(self, func):
+        """Decorator that checks if user is in this bot's authorized list."""
+        async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            user_id = update.effective_user.id
+            if user_id not in self.authorized_user_ids:
+                self._log.warning(f"Unauthorized access attempt from user {user_id}")
+                await update.message.reply_text("Unauthorized.")
+                return
+            return await func(update, context)
+        return wrapper
+
+    def _make_handlers(self):
+        """Create handler functions closed over this BotInstance."""
+        bot = self
+
+        @bot._authorized
+        async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+            chat_id = update.effective_chat.id
+            user_text = update.message.text
+            if not user_text:
+                return
+
+            lock = bot.get_chat_lock(chat_id)
+            if lock.locked():
+                await update.message.reply_text(
+                    "Still processing the previous message. Please wait."
+                )
+                return
+
+            async with lock:
+                result, _ = await bot.call_claude_with_retry(
+                    user_text, chat_id, chat=update.message.chat
+                )
+                await send_long_message(update, result)
+
+        @bot._authorized
+        async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+            chat_id = update.effective_chat.id
+            doc = update.message.document
+
+            lock = bot.get_chat_lock(chat_id)
+            if lock.locked():
+                await update.message.reply_text(
+                    "Still processing the previous message. Please wait."
+                )
+                return
+
+            async with lock:
+                file = await doc.get_file()
+                file_name = doc.file_name or f"document_{doc.file_id}"
+                save_path = bot.downloads_dir / file_name
+                await file.download_to_drive(save_path)
+                bot._log.info(f"Downloaded document: {save_path}")
+
+                caption = update.message.caption or ""
+                prompt = f"I'm sending you a file saved at: {save_path}\nFilename: {file_name}"
+                if caption:
+                    prompt += f"\n\nUser message: {caption}"
+                else:
+                    prompt += "\n\nPlease read and summarize this file."
+
+                result, _ = await bot.call_claude_with_retry(
+                    prompt, chat_id, chat=update.message.chat
+                )
+                await send_long_message(update, result)
+
+        @bot._authorized
+        async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+            chat_id = update.effective_chat.id
+
+            lock = bot.get_chat_lock(chat_id)
+            if lock.locked():
+                await update.message.reply_text(
+                    "Still processing the previous message. Please wait."
+                )
+                return
+
+            async with lock:
+                photo = update.message.photo[-1]
+                file = await photo.get_file()
+                file_name = f"photo_{photo.file_unique_id}.jpg"
+                save_path = bot.downloads_dir / file_name
+                await file.download_to_drive(save_path)
+                bot._log.info(f"Downloaded photo: {save_path}")
+
+                caption = update.message.caption or ""
+                prompt = f"I'm sending you an image saved at: {save_path}"
+                if caption:
+                    prompt += f"\n\nUser message: {caption}"
+                else:
+                    prompt += "\n\nPlease describe and analyze this image."
+
+                result, _ = await bot.call_claude_with_retry(
+                    prompt, chat_id, chat=update.message.chat
+                )
+                await send_long_message(update, result)
+
+        @bot._authorized
+        async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+            chat_id = update.effective_chat.id
+            bot.clear_session(chat_id)
+            await update.message.reply_text(
+                "Session cleared. Next message starts a fresh conversation."
+            )
+
+        @bot._authorized
+        async def cmd_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+            chat_id = update.effective_chat.id
+            session_id = bot.get_session_id(chat_id)
+            if session_id:
+                await update.message.reply_text(f"Session: {session_id}")
+            else:
+                await update.message.reply_text("No active session.")
+
+        @bot._authorized
+        async def handle_claude_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+            chat_id = update.effective_chat.id
+            user_text = update.message.text
+
+            parts = user_text.split(None, 1)
+            tg_cmd = parts[0].lstrip("/").split("@")[0]
+            original = bot._telegram_to_claude_cmd.get(tg_cmd, tg_cmd)
+            user_text = "/" + original
+            if len(parts) > 1:
+                user_text += " " + parts[1]
+
+            lock = bot.get_chat_lock(chat_id)
+            if lock.locked():
+                await update.message.reply_text(
+                    "Still processing the previous message. Please wait."
+                )
+                return
+
+            async with lock:
+                result, _ = await bot.call_claude_with_retry(
+                    user_text, chat_id, chat=update.message.chat
+                )
+                await send_long_message(update, result)
+
+        @bot._authorized
+        async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+            await update.message.reply_text(
+                "Claude Code bot ready.\n\n"
+                "Send any message to chat with Claude.\n"
+                "/new - Start a fresh session\n"
+                "/session - Show current session ID"
+            )
+
+        return {
+            "handle_message": handle_message,
+            "handle_document": handle_document,
+            "handle_photo": handle_photo,
+            "cmd_new": cmd_new,
+            "cmd_session": cmd_session,
+            "handle_claude_command": handle_claude_command,
+            "cmd_start": cmd_start,
+        }
+
+    # --- Lifecycle ---
+
+    async def build_and_start(self) -> None:
+        """Build the Application, register handlers, and start polling."""
+        app = Application.builder().token(self.token).build()
+
+        handlers = self._make_handlers()
+
+        app.add_handler(CommandHandler("start", handlers["cmd_start"]))
+        app.add_handler(CommandHandler("new", handlers["cmd_new"]))
+        app.add_handler(CommandHandler("session", handlers["cmd_session"]))
+        app.add_handler(MessageHandler(filters.COMMAND, handlers["handle_claude_command"]))
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handlers["handle_message"]))
+        app.add_handler(MessageHandler(filters.Document.ALL, handlers["handle_document"]))
+        app.add_handler(MessageHandler(filters.PHOTO, handlers["handle_photo"]))
+
+        self._app = app
+
+        await app.initialize()
+
+        # Discover commands and register with Telegram (post_init doesn't
+        # fire with manual lifecycle, so we do it here after initialize).
+        claude_cmds = self.discover_claude_commands()
+        all_commands = BOT_COMMANDS + claude_cmds
+        self._log.info(
+            f"Registering {len(all_commands)} commands "
+            f"({len(BOT_COMMANDS)} bot + {len(claude_cmds)} Claude)"
+        )
+        await app.bot.set_my_commands(all_commands)
+
+        await app.updater.start_polling(drop_pending_updates=True)
+        await app.start()
+
+        self._log.info(
+            f"Bot '{self.name}' started (authorized users: {self.authorized_user_ids})"
+        )
+
+    async def stop(self) -> None:
+        """Gracefully shut down the bot."""
+        if self._app:
+            self._log.info(f"Stopping bot '{self.name}'...")
+            await self._app.updater.stop()
+            await self._app.stop()
+            await self._app.shutdown()
+            self._log.info(f"Bot '{self.name}' stopped.")
 
 
-async def post_init(application) -> None:
-    """Register bot + Claude slash commands with Telegram on startup."""
-    claude_cmds = discover_claude_commands()
-    all_commands = BOT_COMMANDS + claude_cmds
-    logger.info(
-        f"Registering {len(all_commands)} commands "
-        f"({len(BOT_COMMANDS)} bot + {len(claude_cmds)} Claude)"
-    )
-    await application.bot.set_my_commands(all_commands)
+# --- Configuration ---
+
+CONFIG_FILE = Path(__file__).parent / "bots_config.yaml"
+
+
+def load_config() -> list[BotInstance]:
+    """Load bot configuration from bots_config.yaml."""
+    if not CONFIG_FILE.exists():
+        logger.error(f"Config file not found: {CONFIG_FILE}")
+        logger.error("Please create bots_config.yaml (see bots_config.sample.yaml)")
+        sys.exit(1)
+
+    with open(CONFIG_FILE) as f:
+        config = yaml.safe_load(f)
+
+    # Top-level defaults
+    default_claude_bin = config.get("claude_bin", "claude")
+    default_claude_timeout = config.get("claude_timeout", 300)
+
+    bots_cfg = config.get("bots", [])
+    if not bots_cfg:
+        logger.error("No bots configured in bots_config.json")
+        sys.exit(1)
+
+    instances = []
+    for bot_cfg in bots_cfg:
+        name = bot_cfg["name"]
+
+        token = bot_cfg.get("token")
+        if not token:
+            logger.error(f"Bot '{name}': no token configured")
+            sys.exit(1)
+
+        working_dir = bot_cfg.get("working_dir", ".")
+        authorized = set(bot_cfg.get("authorized_user_ids", []))
+
+        claude_timeout = bot_cfg.get("claude_timeout", default_claude_timeout)
+
+        instances.append(BotInstance(
+            name=name,
+            token=token,
+            authorized_user_ids=authorized,
+            working_dir=working_dir,
+            claude_bin=default_claude_bin,
+            claude_timeout=claude_timeout,
+        ))
+
+    return instances
+
+
+# --- Main ---
+
+async def run_all() -> None:
+    """Start all configured bots and wait for shutdown signal."""
+    instances = load_config()
+
+    # Start all bots
+    for inst in instances:
+        await inst.build_and_start()
+
+    logger.info(f"All {len(instances)} bot(s) running. Press Ctrl+C to stop.")
+
+    # Wait for shutdown signal
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, stop_event.set)
+
+    await stop_event.wait()
+
+    # Graceful shutdown
+    logger.info("Shutting down...")
+    for inst in instances:
+        await inst.stop()
+    logger.info("All bots stopped.")
 
 
 def main() -> None:
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
-
-    # Bot-specific commands
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("new", cmd_new))
-    app.add_handler(CommandHandler("session", cmd_session))
-
-    # Forward any other /command to Claude
-    app.add_handler(MessageHandler(filters.COMMAND, handle_claude_command))
-
-    # Regular text, documents, photos
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-
-    logger.info(f"Bot starting (authorized users: {AUTHORIZED_USER_IDS})")
-    app.run_polling(drop_pending_updates=True)
+    asyncio.run(run_all())
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
-.env
 .venv/
 .claude/
-sessions.json
-downloads/
+sessions_*.json
+downloads_*/
 __pycache__/
+bots_config.yaml
