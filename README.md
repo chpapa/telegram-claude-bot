@@ -37,8 +37,6 @@ Some of us have been running Claude Code on an Obsidian vault as a personal assi
    # Edit bots_config.yaml with your bot token(s), user IDs, and working directories
    ```
 
-   To find your Telegram user ID, message [@userinfobot](https://t.me/userinfobot).
-
 3. **Run the bot**
    ```bash
    uv run python telegram_claude_bot.py
@@ -46,29 +44,15 @@ Some of us have been running Claude Code on an Obsidian vault as a personal assi
 
 ## Configuration
 
-All configuration lives in `bots_config.yaml`. See `bots_config.sample.yaml` for all available options with comments.
+All configuration lives in `bots_config.yaml`. Copy `bots_config.sample.yaml` to get started -- it documents every option with inline comments.
 
-```yaml
-claude_bin: /usr/local/bin/claude   # optional, defaults to "claude"
-# claude_timeout: 300               # optional, defaults to 300s
+To find your Telegram user ID, message [@userinfobot](https://t.me/userinfobot).
 
-bots:
-  - name: my-bot
-    token: "123456:ABC-DEF..."
-    authorized_user_ids: [123456789]
-    working_dir: /home/me/notes
-```
+You can run multiple bots by adding entries under `bots:`. Each bot gets its own session file (`sessions_{name}.json`) and download directory (`downloads_{name}/`), so they operate independently.
 
-| Field | Scope | Required | Default | Description |
-|-------|-------|----------|---------|-------------|
-| `claude_bin` | top-level | No | `claude` | Path to Claude Code CLI binary |
-| `claude_timeout` | top-level / per-bot | No | `300` | Max seconds to wait for Claude response |
-| `name` | per-bot | Yes | -- | Used for logs, session files, download dirs |
-| `token` | per-bot | Yes | -- | Bot token from @BotFather |
-| `authorized_user_ids` | per-bot | Yes | -- | List of Telegram user IDs allowed to use this bot |
-| `working_dir` | per-bot | No | `.` | Working directory for Claude |
+## Running as a Background Service
 
-## Running as a systemd Service
+### Linux (systemd)
 
 Create `~/.config/systemd/user/telegram-claude-bot.service`:
 
@@ -99,6 +83,10 @@ systemctl --user start telegram-claude-bot.service
 # View logs
 journalctl --user -u telegram-claude-bot.service -f
 ```
+
+### macOS (launchd)
+
+TBD
 
 ## Bot Commands
 

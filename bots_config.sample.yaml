@@ -1,14 +1,18 @@
-# Top-level defaults (all optional, can be overridden per-bot)
-# claude_bin: /usr/local/bin/claude    # defaults to "claude"
-# claude_timeout: 300                  # seconds before killing a Claude call
+# Top-level defaults (all optional)
+# claude_bin: /usr/local/bin/claude    # Path to Claude Code CLI binary. Defaults to "claude".
+# claude_timeout: 300                  # Max seconds to wait for a Claude response. Defaults to 300.
 
 bots:
-  - name: obsidian                     # used for logs, session file, downloads dir
-    token: "123456:ABC-DEF..."         # Telegram bot token from @BotFather
-    authorized_user_ids: [123456789]   # Telegram user IDs allowed to use this bot
-    working_dir: /home/me/notes        # Claude's working directory
-    # claude_timeout: 600              # per-bot override
+  # Each bot runs independently with its own token, users, and working directory.
+  # Sessions are stored in sessions_{name}.json, downloads in downloads_{name}/.
 
+  - name: obsidian                     # Identifier for this bot (used in logs, filenames)
+    token: "123456:ABC-DEF..."         # Telegram bot token from @BotFather (required)
+    authorized_user_ids: [123456789]   # Telegram user IDs allowed to use this bot (required)
+    working_dir: /home/me/notes        # Working directory for Claude (defaults to ".")
+    # claude_timeout: 600              # Override the top-level timeout for this bot
+
+  # Add more bots by uncommenting and filling in:
   # - name: code
   #   token: "789012:GHI-JKL..."
   #   authorized_user_ids: [123456789]
