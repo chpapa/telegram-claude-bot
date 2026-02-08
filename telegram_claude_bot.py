@@ -455,14 +455,20 @@ class BotInstance:
             if not d.is_dir():
                 continue
             for f in sorted(d.iterdir()):
-                if not f.suffix == ".md" or not f.is_file():
+                # Commands are .md files; skills are directories with SKILL.md
+                if f.is_file() and f.suffix == ".md":
+                    name = f.stem
+                    desc_file = f
+                elif f.is_dir() and (f / "SKILL.md").is_file():
+                    name = f.name
+                    desc_file = f / "SKILL.md"
+                else:
                     continue
-                name = f.stem
                 if name in seen:
                     continue
                 seen.add(name)
                 try:
-                    first_line = f.read_text().strip().split("\n")[0].strip()
+                    first_line = desc_file.read_text().strip().split("\n")[0].strip()
                     desc = first_line.lstrip("#").strip()
                     if not desc:
                         desc = name
