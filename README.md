@@ -8,11 +8,12 @@ Some of us have been running Claude Code on an Obsidian vault as a personal assi
 
 ## Features
 
+- **Multi-bot** -- run multiple bots in a single process, each with its own token, users, and working directory
 - **Session continuity** -- conversations persist across messages using `--resume`
 - **Streaming status** -- typing indicator + tool usage updates while Claude works
 - **Formatted output** -- markdown converted to Telegram HTML (bold, italic, code blocks, tables)
 - **Slash commands** -- auto-discovers custom Claude commands/skills and registers them in the Telegram menu
-- **Multi-user** -- authorize multiple Telegram user IDs
+- **Multi-user** -- authorize multiple Telegram user IDs per bot
 - **File support** -- send PDFs, images, and other documents for Claude to analyze
 
 ## Prerequisites
@@ -30,10 +31,10 @@ Some of us have been running Claude Code on an Obsidian vault as a personal assi
    cd telegram-claude-bot
    ```
 
-2. **Configure environment**
+2. **Configure**
    ```bash
-   cp .env.example .env
-   # Edit .env with your bot token and Telegram user ID
+   cp bots_config.sample.yaml bots_config.yaml
+   # Edit bots_config.yaml with your bot token(s), user IDs, and working directories
    ```
 
    To find your Telegram user ID, message [@userinfobot](https://t.me/userinfobot).
@@ -43,15 +44,29 @@ Some of us have been running Claude Code on an Obsidian vault as a personal assi
    uv run python telegram_claude_bot.py
    ```
 
-## Environment Variables
+## Configuration
 
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `TELEGRAM_BOT_TOKEN` | Yes | -- | Bot token from @BotFather |
-| `AUTHORIZED_USER_IDS` | Yes | -- | Comma-separated Telegram user IDs |
-| `CLAUDE_BIN` | No | `claude` | Path to Claude Code CLI binary |
-| `WORKING_DIR` | No | `.` | Working directory for Claude (e.g. your project root) |
-| `CLAUDE_TIMEOUT` | No | `300` | Max seconds to wait for Claude response |
+All configuration lives in `bots_config.yaml`. See `bots_config.sample.yaml` for all available options with comments.
+
+```yaml
+claude_bin: /usr/local/bin/claude   # optional, defaults to "claude"
+# claude_timeout: 300               # optional, defaults to 300s
+
+bots:
+  - name: my-bot
+    token: "123456:ABC-DEF..."
+    authorized_user_ids: [123456789]
+    working_dir: /home/me/notes
+```
+
+| Field | Scope | Required | Default | Description |
+|-------|-------|----------|---------|-------------|
+| `claude_bin` | top-level | No | `claude` | Path to Claude Code CLI binary |
+| `claude_timeout` | top-level / per-bot | No | `300` | Max seconds to wait for Claude response |
+| `name` | per-bot | Yes | -- | Used for logs, session files, download dirs |
+| `token` | per-bot | Yes | -- | Bot token from @BotFather |
+| `authorized_user_ids` | per-bot | Yes | -- | List of Telegram user IDs allowed to use this bot |
+| `working_dir` | per-bot | No | `.` | Working directory for Claude |
 
 ## Running as a systemd Service
 
