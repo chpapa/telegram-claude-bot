@@ -32,10 +32,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-ALLOWED_TOOLS = (
-    "Bash,Read,Write,Edit,Glob,Grep,WebFetch,WebSearch,Skill,Task"
-)
-
 # --- Markdown to Telegram HTML (module-level, no per-bot state) ---
 
 def _extract_tables(text: str) -> tuple[str, list[str]]:
@@ -232,6 +228,10 @@ BOT_COMMANDS = [
 class BotInstance:
     """Encapsulates all per-bot state and handlers."""
 
+    DEFAULT_ALLOWED_TOOLS = (
+        "Bash,Read,Write,Edit,Glob,Grep,WebFetch,WebSearch,Skill,Task"
+    )
+
     def __init__(
         self,
         name: str,
@@ -240,6 +240,8 @@ class BotInstance:
         working_dir: str,
         claude_bin: str = "claude",
         claude_timeout: int = 300,
+        allowed_tools: str = DEFAULT_ALLOWED_TOOLS,
+        verbose: bool = True,
     ):
         self.name = name
         self.token = token
@@ -247,6 +249,8 @@ class BotInstance:
         self.working_dir = working_dir
         self.claude_bin = claude_bin
         self.claude_timeout = claude_timeout
+        self.allowed_tools = allowed_tools
+        self.verbose = verbose
 
         base = Path(__file__).parent
         self.sessions_file = base / f"sessions_{name}.json"
@@ -305,7 +309,7 @@ class BotInstance:
             message,
             "--output-format", "stream-json",
             "--verbose",
-            "--allowedTools", ALLOWED_TOOLS,
+            "--allowedTools", self.allowed_tools,
         ]
         if session_id:
             args.extend(["--resume", session_id])
@@ -376,7 +380,7 @@ class BotInstance:
                     if msg_type == "assistant":
                         content = data.get("message", {}).get("content", [])
                         for block in content:
-                            if block.get("type") == "tool_use" and chat:
+                            if self.verbose and block.get("type") == "tool_use" and chat:
                                 tool_name = block.get("name", "unknown")
                                 now = time.monotonic()
                                 if now - last_status_time >= STATUS_THROTTLE_SECS:
@@ -714,6 +718,8 @@ def load_config() -> list[BotInstance]:
         authorized = set(bot_cfg.get("authorized_user_ids", []))
 
         claude_timeout = bot_cfg.get("claude_timeout", default_claude_timeout)
+        allowed_tools = bot_cfg.get("allowed_tools", BotInstance.DEFAULT_ALLOWED_TOOLS)
+        verbose = bot_cfg.get("verbose", True)
 
         instances.append(BotInstance(
             name=name,
@@ -722,6 +728,8 @@ def load_config() -> list[BotInstance]:
             working_dir=working_dir,
             claude_bin=default_claude_bin,
             claude_timeout=claude_timeout,
+            allowed_tools=allowed_tools,
+            verbose=verbose,
         ))
 
     return instances

@@ -11,6 +11,8 @@ bots:
     authorized_user_ids: [123456789]   # Telegram user IDs allowed to use this bot (required)
     working_dir: /home/me/notes        # Working directory for Claude (defaults to ".")
     # claude_timeout: 600              # Override the top-level timeout for this bot
+    # allowed_tools: "Bash,Read,Write,Edit,Glob,Grep,WebFetch,WebSearch,Skill,Task"
+    # verbose: true                    # Set to false to suppress tool-usage status messages
 
   # Add more bots by uncommenting and filling in:
   # - name: code
