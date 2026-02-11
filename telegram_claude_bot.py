@@ -684,6 +684,23 @@ class BotInstance:
         app.add_handler(MessageHandler(filters.Document.ALL, handlers["handle_document"]))
         app.add_handler(MessageHandler(filters.PHOTO, handlers["handle_photo"]))
 
+        async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+            err = context.error
+            self._log.error(f"Update caused error: {err}", exc_info=err)
+            if not (isinstance(update, Update) and update.effective_message):
+                return
+            if isinstance(err, NetworkError):
+                msg = "Network error — couldn't reach Telegram servers. Your message may not have been processed. Please resend it."
+            else:
+                err_name = type(err).__name__
+                msg = f"Something went wrong ({err_name}). Please try again."
+            try:
+                await update.effective_message.reply_text(msg)
+            except Exception:
+                pass  # if we can't even send the error message, just log
+
+        app.add_error_handler(error_handler)
+
         self._app = app
 
         await app.initialize()
