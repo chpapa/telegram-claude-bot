@@ -590,10 +590,16 @@ class BotInstance:
                 return
 
             async with lock:
-                file = await doc.get_file()
-                file_name = doc.file_name or f"document_{doc.file_id}"
-                save_path = bot.downloads_dir / file_name
-                await file.download_to_drive(save_path)
+                try:
+                    file = await _retry_on_network_error(lambda: doc.get_file(), retry_timeout=True)
+                    file_name = doc.file_name or f"document_{doc.file_id}"
+                    save_path = bot.downloads_dir / file_name
+                    await _retry_on_network_error(lambda: file.download_to_drive(save_path), retry_timeout=True)
+                except NetworkError:
+                    await update.message.reply_text(
+                        "Could not download your document (network error). Please resend it."
+                    )
+                    return
                 bot._log.info(f"Downloaded document: {save_path}")
 
                 caption = update.message.caption or ""
@@ -621,10 +627,16 @@ class BotInstance:
 
             async with lock:
                 photo = update.message.photo[-1]
-                file = await photo.get_file()
-                file_name = f"photo_{photo.file_unique_id}.jpg"
-                save_path = bot.downloads_dir / file_name
-                await file.download_to_drive(save_path)
+                try:
+                    file = await _retry_on_network_error(lambda: photo.get_file(), retry_timeout=True)
+                    file_name = f"photo_{photo.file_unique_id}.jpg"
+                    save_path = bot.downloads_dir / file_name
+                    await _retry_on_network_error(lambda: file.download_to_drive(save_path), retry_timeout=True)
+                except NetworkError:
+                    await update.message.reply_text(
+                        "Could not download your photo (network error). Please resend it."
+                    )
+                    return
                 bot._log.info(f"Downloaded photo: {save_path}")
 
                 caption = update.message.caption or ""
@@ -722,7 +734,12 @@ class BotInstance:
             if not (isinstance(update, Update) and update.effective_message):
                 return
             if isinstance(err, NetworkError):
-                msg = "Network error — couldn't reach Telegram servers. Your message may not have been processed. Please resend it."
+                # Use the error message if we set a specific one, otherwise generic
+                err_msg = str(err)
+                if err_msg and "Please resend" in err_msg:
+                    msg = err_msg
+                else:
+                    msg = "Network error while processing your message. Please try again."
             else:
                 err_name = type(err).__name__
                 msg = f"Something went wrong ({err_name}). Please try again."
