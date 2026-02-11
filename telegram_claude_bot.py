@@ -455,8 +455,8 @@ class BotInstance:
                 typing_task.cancel()
                 try:
                     await typing_task
-                except asyncio.CancelledError:
-                    pass
+                except (asyncio.CancelledError, Exception):
+                    pass  # typing task cleanup — ignore any error
 
         if proc.returncode != 0:
             stderr_text = (await proc.stderr.read()).decode().strip()
