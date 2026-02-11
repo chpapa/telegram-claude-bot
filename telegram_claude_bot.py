@@ -545,7 +545,12 @@ class BotInstance:
                 self._log.warning(f"Unauthorized access attempt from user {user_id}")
                 await update.message.reply_text("Unauthorized.")
                 return
-            return await func(update, context)
+            try:
+                return await func(update, context)
+            except TimedOut:
+                # Reply timed out but the action likely completed — don't
+                # bother the user with a scary error for a cosmetic timeout.
+                self._log.warning(f"Handler {func.__name__} hit a timeout (non-critical)")
         return wrapper
 
     def _make_handlers(self):
