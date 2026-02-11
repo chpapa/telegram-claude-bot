@@ -131,7 +131,10 @@ async def send_typing_loop(chat) -> None:
     """Send typing action every 5 seconds until cancelled."""
     try:
         while True:
-            await chat.send_action("typing")
+            try:
+                await chat.send_action("typing")
+            except Exception:
+                pass  # typing indicator is best-effort
             await asyncio.sleep(5)
     except asyncio.CancelledError:
         pass
