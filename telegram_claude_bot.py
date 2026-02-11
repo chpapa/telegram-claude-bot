@@ -338,6 +338,7 @@ class BotInstance:
             "--output-format", "stream-json",
             "--verbose",
             "--allowedTools", self.allowed_tools,
+            "--disallowedTools", "AskUserQuestion,EnterPlanMode,ExitPlanMode",
         ]
         if session_id:
             args.extend(["--resume", session_id])
