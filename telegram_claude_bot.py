@@ -360,6 +360,42 @@ class BotInstance:
         last_status_time = 0.0
         deadline = time.monotonic() + self.claude_timeout
 
+        async def _process_line(raw: bytes) -> None:
+            nonlocal result_text, new_session_id, last_status_time
+            line = raw.decode().strip()
+            if not line:
+                return
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                return
+
+            msg_type = data.get("type")
+
+            if "session_id" in data:
+                new_session_id = data["session_id"]
+
+            if msg_type == "assistant":
+                content = data.get("message", {}).get("content", [])
+                for block in content:
+                    if self.verbose and block.get("type") == "tool_use" and chat:
+                        tool_name = block.get("name", "unknown")
+                        now = time.monotonic()
+                        if now - last_status_time >= STATUS_THROTTLE_SECS:
+                            label = _TOOL_LABELS.get(tool_name, f"Using {tool_name}")
+                            detail = _tool_detail(tool_name, block.get("input", {}))
+                            status = f"⏳ {label}..."
+                            if detail:
+                                status += f"\n<code>{html_mod.escape(detail)}</code>"
+                            try:
+                                await chat.send_message(status, parse_mode="HTML")
+                                last_status_time = now
+                            except Exception:
+                                pass
+
+            elif msg_type == "result":
+                result_text = data.get("result", "")
+
         buf = b""
         try:
             while True:
@@ -391,40 +427,11 @@ class BotInstance:
 
                 while b"\n" in buf:
                     raw_line, buf = buf.split(b"\n", 1)
-                    line = raw_line.decode().strip()
-                    if not line:
-                        continue
+                    await _process_line(raw_line)
 
-                    try:
-                        data = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-
-                    msg_type = data.get("type")
-
-                    if "session_id" in data:
-                        new_session_id = data["session_id"]
-
-                    if msg_type == "assistant":
-                        content = data.get("message", {}).get("content", [])
-                        for block in content:
-                            if self.verbose and block.get("type") == "tool_use" and chat:
-                                tool_name = block.get("name", "unknown")
-                                now = time.monotonic()
-                                if now - last_status_time >= STATUS_THROTTLE_SECS:
-                                    label = _TOOL_LABELS.get(tool_name, f"Using {tool_name}")
-                                    detail = _tool_detail(tool_name, block.get("input", {}))
-                                    status = f"⏳ {label}..."
-                                    if detail:
-                                        status += f"\n<code>{html_mod.escape(detail)}</code>"
-                                    try:
-                                        await chat.send_message(status, parse_mode="HTML")
-                                        last_status_time = now
-                                    except Exception:
-                                        pass
-
-                    elif msg_type == "result":
-                        result_text = data.get("result", "")
+            # Process any remaining data in buffer (last line without trailing \n)
+            if buf.strip():
+                await _process_line(buf)
 
             await proc.wait()
 
@@ -445,6 +452,11 @@ class BotInstance:
             )
 
         if not result_text:
+            stderr_text = (await proc.stderr.read()).decode().strip()
+            self._log.warning(
+                f"Claude returned empty result (exit code {proc.returncode}). "
+                f"stderr: {stderr_text[:500]}"
+            )
             return "Claude returned an empty response.", new_session_id
 
         return result_text, new_session_id
