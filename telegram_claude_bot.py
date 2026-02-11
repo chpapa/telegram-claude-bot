@@ -725,7 +725,12 @@ class BotInstance:
             f"Registering {len(all_commands)} commands "
             f"({len(BOT_COMMANDS)} bot + {len(claude_cmds)} Claude)"
         )
-        await app.bot.set_my_commands(all_commands)
+        # set_my_commands is non-essential; don't let a timeout block startup
+        try:
+            await app.bot.set_my_commands(all_commands)
+        except NetworkError:
+            self._log.warning("Failed to register commands (network), will retry later")
+            asyncio.get_event_loop().create_task(self._retry_set_commands(all_commands))
 
         await app.updater.start_polling(drop_pending_updates=True)
         await app.start()
@@ -733,6 +738,17 @@ class BotInstance:
         self._log.info(
             f"Bot '{self.name}' started (authorized users: {self.authorized_user_ids})"
         )
+
+    async def _retry_set_commands(self, commands: list[tuple[str, str]]) -> None:
+        """Retry registering commands in the background."""
+        for delay in [10, 30, 60]:
+            await asyncio.sleep(delay)
+            try:
+                await self._app.bot.set_my_commands(commands)
+                self._log.info("Successfully registered commands on retry")
+                return
+            except Exception:
+                self._log.warning(f"Retry set_my_commands failed, next in {delay}s")
 
     async def stop(self) -> None:
         """Gracefully shut down the bot."""
@@ -800,15 +816,39 @@ def load_config() -> list[BotInstance]:
 
 # --- Main ---
 
+async def _retry_bot_start(inst: BotInstance, delays=(15, 30, 60, 120)) -> None:
+    """Retry starting a bot that failed on initial startup."""
+    for delay in delays:
+        logger.info(f"Retrying bot '{inst.name}' in {delay}s...")
+        await asyncio.sleep(delay)
+        try:
+            await inst.build_and_start()
+            logger.info(f"Bot '{inst.name}' started on retry")
+            return
+        except Exception:
+            logger.warning(f"Retry for bot '{inst.name}' failed", exc_info=True)
+    logger.error(f"Bot '{inst.name}' failed all retry attempts")
+
+
 async def run_all() -> None:
     """Start all configured bots and wait for shutdown signal."""
     instances = load_config()
 
-    # Start all bots
+    # Start all bots, tolerating individual failures
+    started = 0
     for inst in instances:
-        await inst.build_and_start()
+        try:
+            await inst.build_and_start()
+            started += 1
+        except Exception:
+            logger.error(f"Failed to start bot '{inst.name}', will retry in background", exc_info=True)
+            asyncio.get_event_loop().create_task(_retry_bot_start(inst))
 
-    logger.info(f"All {len(instances)} bot(s) running. Press Ctrl+C to stop.")
+    if started == 0:
+        logger.error("No bots started successfully, exiting")
+        sys.exit(1)
+
+    logger.info(f"{started}/{len(instances)} bot(s) running. Press Ctrl+C to stop.")
 
     # Wait for shutdown signal
     stop_event = asyncio.Event()
