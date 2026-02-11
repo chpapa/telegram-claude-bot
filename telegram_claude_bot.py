@@ -18,6 +18,7 @@ from pathlib import Path
 
 import yaml
 from telegram import Update
+from telegram.error import NetworkError, TimedOut
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -131,10 +132,7 @@ async def send_typing_loop(chat) -> None:
     """Send typing action every 5 seconds until cancelled."""
     try:
         while True:
-            try:
-                await chat.send_action("typing")
-            except Exception:
-                pass  # typing indicator is best-effort
+            await chat.send_action("typing")
             await asyncio.sleep(5)
     except asyncio.CancelledError:
         pass
@@ -206,12 +204,39 @@ def _split_text(text: str) -> list[str]:
     return [c for c in chunks if c.strip()]
 
 
+NETWORK_RETRY_DELAYS = [2, 5, 10]
+
+
+async def _send_with_retry(send_coro_factory, retries=NETWORK_RETRY_DELAYS):
+    """Call send_coro_factory() and retry on network errors with backoff."""
+    last_err = None
+    for attempt, delay in enumerate([0] + list(retries)):
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            return await send_coro_factory()
+        except NetworkError as e:
+            last_err = e
+            logger.warning(f"Network error on send (attempt {attempt + 1}): {e}")
+    raise last_err
+
+
 async def send_long_message(update: Update, text: str) -> None:
     """Send a message with markdown→HTML formatting, falling back to plain text."""
     for chunk in _split_text(text):
         html_chunk = markdown_to_telegram_html(chunk)
         try:
-            await update.message.reply_text(html_chunk, parse_mode="HTML")
+            await _send_with_retry(
+                lambda c=html_chunk: update.message.reply_text(c, parse_mode="HTML")
+            )
+        except NetworkError:
+            logger.warning("HTML send failed after retries, trying plain text")
+            try:
+                await _send_with_retry(
+                    lambda c=chunk: update.message.reply_text(c)
+                )
+            except NetworkError:
+                raise  # let error handler deal with it
         except Exception:
             logger.warning("HTML send failed, falling back to plain text")
             await update.message.reply_text(chunk)
