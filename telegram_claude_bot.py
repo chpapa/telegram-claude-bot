@@ -256,6 +256,27 @@ async def send_long_message(update: Update, text: str) -> None:
             await update.message.reply_text(chunk)
 
 
+async def _check_busy(lock: asyncio.Lock, update: Update) -> bool:
+    """Return True and notify user if lock is held; caller should return immediately."""
+    if lock.locked():
+        await update.message.reply_text("Still processing the previous message. Please wait.")
+        return True
+    return False
+
+
+async def _download_to_disk(tg_obj, save_path: Path, update: Update, noun: str) -> bool:
+    """Download tg_obj to save_path. Returns False and notifies user on NetworkError."""
+    try:
+        file = await _retry_on_network_error(tg_obj.get_file, retry_timeout=True)
+        await _retry_on_network_error(lambda: file.download_to_drive(save_path), retry_timeout=True)
+        return True
+    except NetworkError:
+        await update.message.reply_text(
+            f"Could not download your {noun} (network error). Please resend it."
+        )
+        return False
+
+
 # --- Bot commands list ---
 
 BOT_COMMANDS = [
@@ -301,6 +322,7 @@ class BotInstance:
 
         self._chat_locks: dict[int, asyncio.Lock] = {}
         self._telegram_to_claude_cmd: dict[str, str] = {}
+        self._sessions: dict[str, str] | None = None
         self._app: Application | None = None
 
         self._log = logging.getLogger(f"{__name__}.{name}")
@@ -308,34 +330,37 @@ class BotInstance:
     # --- Session persistence ---
 
     def get_chat_lock(self, chat_id: int) -> asyncio.Lock:
-        if chat_id not in self._chat_locks:
-            self._chat_locks[chat_id] = asyncio.Lock()
-        return self._chat_locks[chat_id]
+        return self._chat_locks.setdefault(chat_id, asyncio.Lock())
 
     def load_sessions(self) -> dict[str, str]:
-        if self.sessions_file.exists():
-            try:
-                return json.loads(self.sessions_file.read_text())
-            except (json.JSONDecodeError, OSError):
-                self._log.warning("Failed to read sessions file, starting fresh")
-        return {}
+        try:
+            return json.loads(self.sessions_file.read_text())
+        except FileNotFoundError:
+            return {}
+        except (json.JSONDecodeError, OSError):
+            self._log.warning("Failed to read sessions file, starting fresh")
+            return {}
 
     def save_sessions(self, sessions: dict[str, str]) -> None:
         tmp = self.sessions_file.with_suffix(".tmp")
         tmp.write_text(json.dumps(sessions, indent=2))
         tmp.rename(self.sessions_file)
 
+    def _cached_sessions(self) -> dict[str, str]:
+        if self._sessions is None:
+            self._sessions = self.load_sessions()
+        return self._sessions
+
     def get_session_id(self, chat_id: int) -> str | None:
-        sessions = self.load_sessions()
-        return sessions.get(str(chat_id))
+        return self._cached_sessions().get(str(chat_id))
 
     def set_session_id(self, chat_id: int, session_id: str) -> None:
-        sessions = self.load_sessions()
+        sessions = self._cached_sessions()
         sessions[str(chat_id)] = session_id
         self.save_sessions(sessions)
 
     def clear_session(self, chat_id: int) -> None:
-        sessions = self.load_sessions()
+        sessions = self._cached_sessions()
         sessions.pop(str(chat_id), None)
         self.save_sessions(sessions)
 
@@ -523,10 +548,9 @@ class BotInstance:
                     continue
                 seen.add(name)
                 try:
-                    first_line = desc_file.read_text().strip().split("\n")[0].strip()
-                    desc = first_line.lstrip("#").strip()
-                    if not desc:
-                        desc = name
+                    with desc_file.open() as fh:
+                        first_line = fh.readline().strip()
+                    desc = first_line.lstrip("#").strip() or name
                 except OSError:
                     desc = name
                 cmd_name = name.lower().replace(" ", "_").replace("-", "_")[:32]
@@ -565,10 +589,7 @@ class BotInstance:
                 return
 
             lock = bot.get_chat_lock(chat_id)
-            if lock.locked():
-                await update.message.reply_text(
-                    "Still processing the previous message. Please wait."
-                )
+            if await _check_busy(lock, update):
                 return
 
             async with lock:
@@ -583,22 +604,13 @@ class BotInstance:
             doc = update.message.document
 
             lock = bot.get_chat_lock(chat_id)
-            if lock.locked():
-                await update.message.reply_text(
-                    "Still processing the previous message. Please wait."
-                )
+            if await _check_busy(lock, update):
                 return
 
             async with lock:
-                try:
-                    file = await _retry_on_network_error(lambda: doc.get_file(), retry_timeout=True)
-                    file_name = doc.file_name or f"document_{doc.file_id}"
-                    save_path = bot.downloads_dir / file_name
-                    await _retry_on_network_error(lambda: file.download_to_drive(save_path), retry_timeout=True)
-                except NetworkError:
-                    await update.message.reply_text(
-                        "Could not download your document (network error). Please resend it."
-                    )
+                file_name = doc.file_name or f"document_{doc.file_id}"
+                save_path = bot.downloads_dir / file_name
+                if not await _download_to_disk(doc, save_path, update, "document"):
                     return
                 bot._log.info(f"Downloaded document: {save_path}")
 
@@ -619,23 +631,14 @@ class BotInstance:
             chat_id = update.effective_chat.id
 
             lock = bot.get_chat_lock(chat_id)
-            if lock.locked():
-                await update.message.reply_text(
-                    "Still processing the previous message. Please wait."
-                )
+            if await _check_busy(lock, update):
                 return
 
             async with lock:
                 photo = update.message.photo[-1]
-                try:
-                    file = await _retry_on_network_error(lambda: photo.get_file(), retry_timeout=True)
-                    file_name = f"photo_{photo.file_unique_id}.jpg"
-                    save_path = bot.downloads_dir / file_name
-                    await _retry_on_network_error(lambda: file.download_to_drive(save_path), retry_timeout=True)
-                except NetworkError:
-                    await update.message.reply_text(
-                        "Could not download your photo (network error). Please resend it."
-                    )
+                file_name = f"photo_{photo.file_unique_id}.jpg"
+                save_path = bot.downloads_dir / file_name
+                if not await _download_to_disk(photo, save_path, update, "photo"):
                     return
                 bot._log.info(f"Downloaded photo: {save_path}")
 
@@ -681,10 +684,7 @@ class BotInstance:
                 user_text += " " + parts[1]
 
             lock = bot.get_chat_lock(chat_id)
-            if lock.locked():
-                await update.message.reply_text(
-                    "Still processing the previous message. Please wait."
-                )
+            if await _check_busy(lock, update):
                 return
 
             async with lock:
@@ -767,7 +767,7 @@ class BotInstance:
             await app.bot.set_my_commands(all_commands)
         except NetworkError:
             self._log.warning("Failed to register commands (network), will retry later")
-            asyncio.get_event_loop().create_task(self._retry_set_commands(all_commands))
+            asyncio.create_task(self._retry_set_commands(all_commands))
 
         await app.updater.start_polling(drop_pending_updates=True)
         await app.start()
@@ -818,7 +818,7 @@ def load_config() -> list[BotInstance]:
 
     bots_cfg = config.get("bots", [])
     if not bots_cfg:
-        logger.error("No bots configured in bots_config.json")
+        logger.error("No bots configured in bots_config.yaml")
         sys.exit(1)
 
     instances = []
@@ -879,7 +879,7 @@ async def run_all() -> None:
             started += 1
         except Exception:
             logger.error(f"Failed to start bot '{inst.name}', will retry in background", exc_info=True)
-            asyncio.get_event_loop().create_task(_retry_bot_start(inst))
+            asyncio.create_task(_retry_bot_start(inst))
 
     if started == 0:
         logger.error("No bots started successfully, exiting")
