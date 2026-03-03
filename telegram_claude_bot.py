@@ -276,10 +276,13 @@ async def send_long_message(
     return first_sent
 
 
-async def _check_busy(lock: asyncio.Lock, update: Update) -> bool:
+async def _check_busy(lock: asyncio.Lock, update: Update, session_key: str | None = None) -> bool:
     """Return True and notify user if lock is held; caller should return immediately."""
     if lock.locked():
-        await update.message.reply_text("Still processing the previous message. Please wait.")
+        if session_key:
+            await update.message.reply_text(f"Session {session_key} is still processing. Please wait.")
+        else:
+            await update.message.reply_text("Still processing the previous message. Please wait.")
         return True
     return False
 
@@ -342,7 +345,7 @@ class BotInstance:
         self.downloads_dir = base / f"downloads_{name}"
         self.downloads_dir.mkdir(exist_ok=True)
 
-        self._chat_locks: dict[int, asyncio.Lock] = {}
+        self._session_locks: dict[tuple[int, str], asyncio.Lock] = {}
         self._telegram_to_claude_cmd: dict[str, str] = {}
         self._sessions: dict | None = None
         self._app: Application | None = None
@@ -351,8 +354,8 @@ class BotInstance:
 
     # --- Session persistence ---
 
-    def get_chat_lock(self, chat_id: int) -> asyncio.Lock:
-        return self._chat_locks.setdefault(chat_id, asyncio.Lock())
+    def get_session_lock(self, chat_id: int, session_key: str | None) -> asyncio.Lock:
+        return self._session_locks.setdefault((chat_id, session_key or "_"), asyncio.Lock())
 
     def load_sessions(self) -> dict:
         try:
@@ -401,6 +404,7 @@ class BotInstance:
         sessions = self._cached_sessions()
         sessions.pop(str(chat_id), None)
         self.save_sessions(sessions)
+        self._session_locks.pop((chat_id, "_"), None)
 
     # --- Multi-session methods (used when multi_session=True) ---
 
@@ -640,10 +644,9 @@ class BotInstance:
                 self.set_session_id(chat_id, new_session_id)
             return result, new_session_id
 
-    async def _invoke_claude(self, update: Update, chat_id: int, text: str) -> None:
+    async def _invoke_claude(self, update: Update, chat_id: int, text: str, session_key: str | None = None) -> None:
         """Call Claude, send the response, and record the bot message for session routing."""
         if self.multi_session:
-            session_key = self.resolve_session_key(chat_id, update.message)
             result, _ = await self.call_claude_with_retry(
                 text, chat_id, session_key, chat=update.message.chat
             )
@@ -657,6 +660,15 @@ class BotInstance:
                 text, chat_id, chat=update.message.chat
             )
             await send_long_message(update, result)
+
+    async def _run_with_lock(self, update: Update, chat_id: int, text: str) -> None:
+        """Acquire the appropriate lock and invoke Claude."""
+        session_key = self.resolve_session_key(chat_id, update.message) if self.multi_session else None
+        lock = self.get_session_lock(chat_id, session_key)
+        if await _check_busy(lock, update, session_key):
+            return
+        async with lock:
+            await self._invoke_claude(update, chat_id, text, session_key)
 
     # --- Slash command discovery ---
 
@@ -727,62 +739,47 @@ class BotInstance:
             if not user_text:
                 return
 
-            lock = bot.get_chat_lock(chat_id)
-            if await _check_busy(lock, update):
-                return
-
-            async with lock:
-                await bot._invoke_claude(update, chat_id, user_text)
+            await bot._run_with_lock(update, chat_id, user_text)
 
         @bot._authorized
         async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             chat_id = update.effective_chat.id
             doc = update.message.document
 
-            lock = bot.get_chat_lock(chat_id)
-            if await _check_busy(lock, update):
+            file_name = doc.file_name or f"document_{doc.file_id}"
+            save_path = bot.downloads_dir / file_name
+            if not await _download_to_disk(doc, save_path, update, "document"):
                 return
+            bot._log.info(f"Downloaded document: {save_path}")
 
-            async with lock:
-                file_name = doc.file_name or f"document_{doc.file_id}"
-                save_path = bot.downloads_dir / file_name
-                if not await _download_to_disk(doc, save_path, update, "document"):
-                    return
-                bot._log.info(f"Downloaded document: {save_path}")
+            caption = update.message.caption or ""
+            prompt = f"I'm sending you a file saved at: {save_path}\nFilename: {file_name}"
+            if caption:
+                prompt += f"\n\nUser message: {caption}"
+            else:
+                prompt += "\n\nPlease read and summarize this file."
 
-                caption = update.message.caption or ""
-                prompt = f"I'm sending you a file saved at: {save_path}\nFilename: {file_name}"
-                if caption:
-                    prompt += f"\n\nUser message: {caption}"
-                else:
-                    prompt += "\n\nPlease read and summarize this file."
-
-                await bot._invoke_claude(update, chat_id, prompt)
+            await bot._run_with_lock(update, chat_id, prompt)
 
         @bot._authorized
         async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             chat_id = update.effective_chat.id
 
-            lock = bot.get_chat_lock(chat_id)
-            if await _check_busy(lock, update):
+            photo = update.message.photo[-1]
+            file_name = f"photo_{photo.file_unique_id}.jpg"
+            save_path = bot.downloads_dir / file_name
+            if not await _download_to_disk(photo, save_path, update, "photo"):
                 return
+            bot._log.info(f"Downloaded photo: {save_path}")
 
-            async with lock:
-                photo = update.message.photo[-1]
-                file_name = f"photo_{photo.file_unique_id}.jpg"
-                save_path = bot.downloads_dir / file_name
-                if not await _download_to_disk(photo, save_path, update, "photo"):
-                    return
-                bot._log.info(f"Downloaded photo: {save_path}")
+            caption = update.message.caption or ""
+            prompt = f"I'm sending you an image saved at: {save_path}"
+            if caption:
+                prompt += f"\n\nUser message: {caption}"
+            else:
+                prompt += "\n\nPlease describe and analyze this image."
 
-                caption = update.message.caption or ""
-                prompt = f"I'm sending you an image saved at: {save_path}"
-                if caption:
-                    prompt += f"\n\nUser message: {caption}"
-                else:
-                    prompt += "\n\nPlease describe and analyze this image."
-
-                await bot._invoke_claude(update, chat_id, prompt)
+            await bot._run_with_lock(update, chat_id, prompt)
 
         @bot._authorized
         async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -830,12 +827,7 @@ class BotInstance:
             if len(parts) > 1:
                 user_text += " " + parts[1]
 
-            lock = bot.get_chat_lock(chat_id)
-            if await _check_busy(lock, update):
-                return
-
-            async with lock:
-                await bot._invoke_claude(update, chat_id, user_text)
+            await bot._run_with_lock(update, chat_id, user_text)
 
         @bot._authorized
         async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
