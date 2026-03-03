@@ -13,6 +13,7 @@ bots:
     # claude_timeout: 600              # Override the top-level timeout for this bot
     # allowed_tools: "Bash,Read,Write,Edit,Glob,Grep,WebFetch,WebSearch,Skill,Task"
     # verbose: true                    # Set to false to suppress tool-usage status messages
+    # multi_session: true              # Enable multiple sessions per chat via reply threading
 
   # Add more bots by uncommenting and filling in:
   # - name: code

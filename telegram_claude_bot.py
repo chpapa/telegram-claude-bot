@@ -17,7 +17,7 @@ import time
 from pathlib import Path
 
 import yaml
-from telegram import Update
+from telegram import Message, ReplyParameters, Update
 from telegram.error import NetworkError, TimedOut
 from telegram.ext import (
     Application,
@@ -233,19 +233,35 @@ async def _retry_on_network_error(coro_factory, retries=NETWORK_RETRY_DELAYS, re
     raise last_err
 
 
-async def send_long_message(update: Update, text: str) -> None:
-    """Send a message with markdown→HTML formatting, falling back to plain text."""
-    for chunk in _split_text(text):
+async def send_long_message(
+    update: Update, text: str, reply_to_message_id: int | None = None
+) -> Message | None:
+    """Send a message with markdown→HTML formatting, falling back to plain text.
+
+    If reply_to_message_id is given, the first chunk quotes that message and
+    the first sent Message is returned so callers can record its ID for session
+    routing. Otherwise, every chunk quotes the triggering user message.
+    """
+    # Threading mode: only the first chunk gets reply params.
+    # Regular mode: every chunk quotes the triggering message.
+    anchor_id = reply_to_message_id if reply_to_message_id is not None else update.message.message_id
+    first_sent: Message | None = None
+
+    for i, chunk in enumerate(_split_text(text)):
         html_chunk = markdown_to_telegram_html(chunk)
+        use_reply = (reply_to_message_id is None) or (i == 0)
+        rp = ReplyParameters(message_id=anchor_id, allow_sending_without_reply=True) if use_reply else None
         try:
-            await _retry_on_network_error(
-                lambda c=html_chunk: update.message.reply_text(c, parse_mode="HTML")
+            sent = await _retry_on_network_error(
+                lambda c=html_chunk, r=rp: update.message.chat.send_message(
+                    c, parse_mode="HTML", reply_parameters=r
+                )
             )
         except NetworkError:
             logger.warning("HTML send failed after retries, trying plain text")
             try:
-                await _retry_on_network_error(
-                    lambda c=chunk: update.message.reply_text(c)
+                sent = await _retry_on_network_error(
+                    lambda c=chunk, r=rp: update.message.chat.send_message(c, reply_parameters=r)
                 )
             except NetworkError:
                 raise NetworkError(
@@ -253,7 +269,11 @@ async def send_long_message(update: Update, text: str) -> None:
                 )
         except Exception:
             logger.warning("HTML send failed, falling back to plain text")
-            await update.message.reply_text(chunk)
+            sent = await update.message.chat.send_message(chunk, reply_parameters=rp)
+        if first_sent is None:
+            first_sent = sent
+
+    return first_sent
 
 
 async def _check_busy(lock: asyncio.Lock, update: Update) -> bool:
@@ -305,6 +325,7 @@ class BotInstance:
         claude_timeout: int = 300,
         allowed_tools: str = DEFAULT_ALLOWED_TOOLS,
         verbose: bool = True,
+        multi_session: bool = False,
     ):
         self.name = name
         self.token = token
@@ -314,6 +335,7 @@ class BotInstance:
         self.claude_timeout = claude_timeout
         self.allowed_tools = allowed_tools
         self.verbose = verbose
+        self.multi_session = multi_session
 
         base = Path(__file__).parent
         self.sessions_file = base / f"sessions_{name}.json"
@@ -322,7 +344,7 @@ class BotInstance:
 
         self._chat_locks: dict[int, asyncio.Lock] = {}
         self._telegram_to_claude_cmd: dict[str, str] = {}
-        self._sessions: dict[str, str] | None = None
+        self._sessions: dict | None = None
         self._app: Application | None = None
 
         self._log = logging.getLogger(f"{__name__}.{name}")
@@ -332,7 +354,7 @@ class BotInstance:
     def get_chat_lock(self, chat_id: int) -> asyncio.Lock:
         return self._chat_locks.setdefault(chat_id, asyncio.Lock())
 
-    def load_sessions(self) -> dict[str, str]:
+    def load_sessions(self) -> dict:
         try:
             return json.loads(self.sessions_file.read_text())
         except FileNotFoundError:
@@ -341,15 +363,31 @@ class BotInstance:
             self._log.warning("Failed to read sessions file, starting fresh")
             return {}
 
-    def save_sessions(self, sessions: dict[str, str]) -> None:
+    def save_sessions(self, sessions: dict) -> None:
         tmp = self.sessions_file.with_suffix(".tmp")
         tmp.write_text(json.dumps(sessions, indent=2))
         tmp.rename(self.sessions_file)
 
-    def _cached_sessions(self) -> dict[str, str]:
+    def _cached_sessions(self) -> dict:
         if self._sessions is None:
             self._sessions = self.load_sessions()
+            if self.multi_session:
+                # Migrate old single-session format: {"chat_id": "uuid-string"}
+                migrated = False
+                for chat_id, val in list(self._sessions.items()):
+                    if isinstance(val, str):
+                        self._sessions[chat_id] = {
+                            "sessions": {"s0": val},
+                            "active": "s0",
+                            "next_key": 1,
+                            "msg_map": {},
+                        }
+                        migrated = True
+                if migrated:
+                    self.save_sessions(self._sessions)
         return self._sessions
+
+    # --- Single-session methods (used when multi_session=False) ---
 
     def get_session_id(self, chat_id: int) -> str | None:
         return self._cached_sessions().get(str(chat_id))
@@ -363,6 +401,75 @@ class BotInstance:
         sessions = self._cached_sessions()
         sessions.pop(str(chat_id), None)
         self.save_sessions(sessions)
+
+    # --- Multi-session methods (used when multi_session=True) ---
+
+    def _get_chat_data(self, chat_id: int) -> dict:
+        """Return per-chat multi-session data, creating default if absent."""
+        sessions = self._cached_sessions()
+        key = str(chat_id)
+        if key not in sessions:
+            sessions[key] = {
+                "sessions": {"s0": None},
+                "active": "s0",
+                "next_key": 1,
+                "msg_map": {},
+            }
+        return sessions[key]
+
+    def _flush_sessions(self) -> None:
+        if self._sessions is not None:
+            self.save_sessions(self._sessions)
+
+    def create_new_session(self, chat_id: int) -> str:
+        """Allocate a new session key, set it as active, and return it."""
+        data = self._get_chat_data(chat_id)
+        n = data["next_key"]
+        key = f"s{n}"
+        data["sessions"][key] = None
+        data["active"] = key
+        data["next_key"] = n + 1
+        self._flush_sessions()
+        return key
+
+    def resolve_session_key(self, chat_id: int, message) -> str:
+        """Determine which session key to use for an incoming message.
+
+        If the message is a reply to a known bot message, use the session
+        associated with that bot message. Otherwise use the active session.
+        """
+        data = self._get_chat_data(chat_id)
+        if message.reply_to_message:
+            reply_id = str(message.reply_to_message.message_id)
+            if reply_id in data["msg_map"]:
+                return data["msg_map"][reply_id]
+        return data["active"]
+
+    def record_bot_message(self, chat_id: int, msg_id: int, session_key: str) -> None:
+        """Record that a bot message belongs to a session; prune to last 5 per session."""
+        data = self._get_chat_data(chat_id)
+        msg_map = data["msg_map"]
+        msg_map[str(msg_id)] = session_key
+        # Keep only the 5 most recent message IDs per session key
+        session_msgs: dict[str, list[int]] = {}
+        for mid, sk in msg_map.items():
+            session_msgs.setdefault(sk, []).append(int(mid))
+        pruned: dict[str, str] = {}
+        for sk, mids in session_msgs.items():
+            for mid in sorted(mids)[-5:]:
+                pruned[str(mid)] = sk
+        data["msg_map"] = pruned
+        self._flush_sessions()
+
+    def get_session_uuid(self, chat_id: int, session_key: str) -> str | None:
+        """Return the Claude session UUID for a session key, or None if not started."""
+        return self._get_chat_data(chat_id)["sessions"].get(session_key)
+
+    def set_session_uuid(self, chat_id: int, session_key: str, uuid: str | None) -> None:
+        """Store (or clear) the Claude session UUID for a session key."""
+        data = self._get_chat_data(chat_id)
+        data["sessions"][session_key] = uuid
+        self._flush_sessions()
 
     # --- Claude CLI ---
 
@@ -502,22 +609,54 @@ class BotInstance:
         return result_text, new_session_id
 
     async def call_claude_with_retry(
-        self, message: str, chat_id: int, chat=None
+        self, message: str, chat_id: int, session_key: str | None = None, chat=None
     ) -> tuple[str, str | None]:
-        """Call Claude with session resume, retry without session if it fails."""
-        session_id = self.get_session_id(chat_id)
+        """Call Claude with session resume, retry without session if it fails.
 
-        result, new_session_id = await self.call_claude(message, session_id, chat=chat)
+        In multi_session mode, session_key selects which session to use.
+        In single-session mode, session_key is ignored and the flat per-chat
+        session is used.
+        """
+        if self.multi_session:
+            session_uuid = self.get_session_uuid(chat_id, session_key)
+            result, new_uuid = await self.call_claude(message, session_uuid, chat=chat)
+            if session_uuid and result.startswith("Claude error"):
+                self._log.info(
+                    f"Retrying without session for key={session_key} in chat {chat_id}"
+                )
+                self.set_session_uuid(chat_id, session_key, None)
+                result, new_uuid = await self.call_claude(message, None, chat=chat)
+            if new_uuid:
+                self.set_session_uuid(chat_id, session_key, new_uuid)
+            return result, new_uuid
+        else:
+            session_id = self.get_session_id(chat_id)
+            result, new_session_id = await self.call_claude(message, session_id, chat=chat)
+            if session_id and result.startswith("Claude error"):
+                self._log.info(f"Retrying without session for chat {chat_id}")
+                self.clear_session(chat_id)
+                result, new_session_id = await self.call_claude(message, None, chat=chat)
+            if new_session_id:
+                self.set_session_id(chat_id, new_session_id)
+            return result, new_session_id
 
-        if session_id and result.startswith("Claude error"):
-            self._log.info(f"Retrying without session for chat {chat_id}")
-            self.clear_session(chat_id)
-            result, new_session_id = await self.call_claude(message, None, chat=chat)
-
-        if new_session_id:
-            self.set_session_id(chat_id, new_session_id)
-
-        return result, new_session_id
+    async def _invoke_claude(self, update: Update, chat_id: int, text: str) -> None:
+        """Call Claude, send the response, and record the bot message for session routing."""
+        if self.multi_session:
+            session_key = self.resolve_session_key(chat_id, update.message)
+            result, _ = await self.call_claude_with_retry(
+                text, chat_id, session_key, chat=update.message.chat
+            )
+            sent = await send_long_message(
+                update, result, reply_to_message_id=update.message.message_id
+            )
+            if sent:
+                self.record_bot_message(chat_id, sent.message_id, session_key)
+        else:
+            result, _ = await self.call_claude_with_retry(
+                text, chat_id, chat=update.message.chat
+            )
+            await send_long_message(update, result)
 
     # --- Slash command discovery ---
 
@@ -593,10 +732,7 @@ class BotInstance:
                 return
 
             async with lock:
-                result, _ = await bot.call_claude_with_retry(
-                    user_text, chat_id, chat=update.message.chat
-                )
-                await send_long_message(update, result)
+                await bot._invoke_claude(update, chat_id, user_text)
 
         @bot._authorized
         async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -621,10 +757,7 @@ class BotInstance:
                 else:
                     prompt += "\n\nPlease read and summarize this file."
 
-                result, _ = await bot.call_claude_with_retry(
-                    prompt, chat_id, chat=update.message.chat
-                )
-                await send_long_message(update, result)
+                await bot._invoke_claude(update, chat_id, prompt)
 
         @bot._authorized
         async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -649,27 +782,41 @@ class BotInstance:
                 else:
                     prompt += "\n\nPlease describe and analyze this image."
 
-                result, _ = await bot.call_claude_with_retry(
-                    prompt, chat_id, chat=update.message.chat
-                )
-                await send_long_message(update, result)
+                await bot._invoke_claude(update, chat_id, prompt)
 
         @bot._authorized
         async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             chat_id = update.effective_chat.id
-            bot.clear_session(chat_id)
-            await update.message.reply_text(
-                "Session cleared. Next message starts a fresh conversation."
-            )
+            if bot.multi_session:
+                key = bot.create_new_session(chat_id)
+                await update.message.reply_text(
+                    f"New session {key} created and set as active. "
+                    "Old sessions are kept — reply to a previous bot message to resume one."
+                )
+            else:
+                bot.clear_session(chat_id)
+                await update.message.reply_text(
+                    "Session cleared. Next message starts a fresh conversation."
+                )
 
         @bot._authorized
         async def cmd_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             chat_id = update.effective_chat.id
-            session_id = bot.get_session_id(chat_id)
-            if session_id:
-                await update.message.reply_text(f"Session: {session_id}")
+            if bot.multi_session:
+                data = bot._get_chat_data(chat_id)
+                lines = []
+                for key, uuid in data["sessions"].items():
+                    marker = " ← active" if key == data["active"] else ""
+                    status = "started" if uuid else "not started"
+                    lines.append(f"  {key}{marker}: {status}")
+                msg = "Sessions:\n" + "\n".join(lines) if lines else "No sessions yet."
+                await update.message.reply_text(msg)
             else:
-                await update.message.reply_text("No active session.")
+                session_id = bot.get_session_id(chat_id)
+                if session_id:
+                    await update.message.reply_text(f"Session: {session_id}")
+                else:
+                    await update.message.reply_text("No active session.")
 
         @bot._authorized
         async def handle_claude_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -688,19 +835,25 @@ class BotInstance:
                 return
 
             async with lock:
-                result, _ = await bot.call_claude_with_retry(
-                    user_text, chat_id, chat=update.message.chat
-                )
-                await send_long_message(update, result)
+                await bot._invoke_claude(update, chat_id, user_text)
 
         @bot._authorized
         async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-            await update.message.reply_text(
-                "Claude Code bot ready.\n\n"
-                "Send any message to chat with Claude.\n"
-                "/new - Start a fresh session\n"
-                "/session - Show current session ID"
-            )
+            if bot.multi_session:
+                await update.message.reply_text(
+                    "Claude Code bot ready.\n\n"
+                    "Send any message to chat with Claude.\n"
+                    "/new - Create a new session (old sessions are kept)\n"
+                    "/session - List all sessions\n\n"
+                    "Reply to a bot message to continue that session thread."
+                )
+            else:
+                await update.message.reply_text(
+                    "Claude Code bot ready.\n\n"
+                    "Send any message to chat with Claude.\n"
+                    "/new - Start a fresh session\n"
+                    "/session - Show current session ID"
+                )
 
         return {
             "handle_message": handle_message,
@@ -836,6 +989,7 @@ def load_config() -> list[BotInstance]:
         claude_timeout = bot_cfg.get("claude_timeout", default_claude_timeout)
         allowed_tools = bot_cfg.get("allowed_tools", BotInstance.DEFAULT_ALLOWED_TOOLS)
         verbose = bot_cfg.get("verbose", True)
+        multi_session = bot_cfg.get("multi_session", False)
 
         instances.append(BotInstance(
             name=name,
@@ -846,6 +1000,7 @@ def load_config() -> list[BotInstance]:
             claude_timeout=claude_timeout,
             allowed_tools=allowed_tools,
             verbose=verbose,
+            multi_session=multi_session,
         ))
 
     return instances
